@@ -106,22 +106,36 @@ jobs:
           package com.example.demobot
 
           import android.accessibilityservice.AccessibilityService
+          import android.os.Handler
+          import android.os.Looper
           import android.os.SystemClock
           import android.view.accessibility.AccessibilityEvent
           import android.view.accessibility.AccessibilityNodeInfo
 
-          /** 阶段2：只读。遍历目标App的UI树并保存快照，不做任何点击或输入。 */
+          /** 阶段2：只读。遍历界面节点并保存快照，不做任何点击或输入。 */
           class BotAccessibilityService : AccessibilityService() {
+              companion object { @Volatile var instance: BotAccessibilityService? = null }
+
               private var lastDump = 0L
+              private var lastSeenPkg = ""
+              private val handler = Handler(Looper.getMainLooper())
 
               override fun onServiceConnected() {
+                  instance = this
                   BotLog.init(this)
                   BotLog.i("无障碍服务已连接")
+              }
+
+              /** 诊断：延迟N毫秒后读取当前前台窗口(不管包名)，期间请切到MT5 */
+              fun scheduleDump(delayMs: Long) {
+                  BotLog.i("${delayMs / 1000}秒后读取当前窗口，请立刻切到MT5")
+                  handler.postDelayed({ dump(true) }, delayMs)
               }
 
               override fun onAccessibilityEvent(e: AccessibilityEvent?) {
                   e ?: return
                   val pkg = e.packageName?.toString() ?: return
+                  if (pkg != lastSeenPkg) { lastSeenPkg = pkg; BotLog.i("事件来自: $pkg") }
                   if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
                       pkg != "com.android.systemui") Bot.foreground = pkg
 
@@ -130,18 +144,20 @@ jobs:
                   val now = SystemClock.elapsedRealtime()
                   if (now - lastDump < 2000) return
                   lastDump = now
-                  dump()
+                  dump(false)
               }
 
-              private fun dump() {
+              private fun dump(force: Boolean) {
                   val root = rootInActiveWindow
-                  if (root == null) { BotLog.w("读不到界面(可能被目标App屏蔽)"); return }
-                  if (root.packageName?.toString() != Bot.targetPackage) return
+                  if (root == null) { BotLog.w("读不到界面(rootInActiveWindow为空，可能被屏蔽)"); return }
+                  val pkg = root.packageName?.toString() ?: ""
+                  if (!force && pkg != Bot.targetPackage) return
                   val sb = StringBuilder()
                   val count = intArrayOf(0)
                   walk(root, 0, sb, count)
-                  BotLog.saveDump("节点数:${count[0]}\n$sb")
-                  BotLog.i("已保存界面快照，节点 ${count[0]}")
+                  BotLog.saveDump("窗口包名:$pkg 节点数:${count[0]}\n$sb")
+                  BotLog.i("已保存界面快照 包名=$pkg 节点=${count[0]}")
+                  if (count[0] <= 3) BotLog.w("节点很少，该App可能不开放界面信息")
               }
 
               private fun walk(n: AccessibilityNodeInfo, depth: Int, sb: StringBuilder, count: IntArray) {
@@ -167,6 +183,7 @@ jobs:
               }
 
               override fun onUnbind(intent: android.content.Intent?): Boolean {
+                  instance = null
                   if (Bot.state == Bot.State.OBSERVING) Bot.safeStop("无障碍权限被撤销")
                   return super.onUnbind(intent)
               }
@@ -216,6 +233,8 @@ jobs:
           import android.content.Intent
           import android.graphics.Typeface
           import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
           import android.provider.Settings
           import android.widget.*
 
@@ -223,6 +242,10 @@ jobs:
               private lateinit var status: TextView
               private lateinit var pkgInput: EditText
               private lateinit var out: TextView
+              private val h = Handler(Looper.getMainLooper())
+              private val tick = object : Runnable {
+                  override fun run() { refresh(); h.postDelayed(this, 2000) }
+              }
 
               private fun btn(label: String, onClick: () -> Unit) = Button(this).apply {
                   text = label; setOnClickListener { onClick(); refresh() }
@@ -231,27 +254,30 @@ jobs:
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
                   BotLog.init(this)
-                  Bot.state = Bot.State.IDLE            // 重启后绝不自动续作
 
                   val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 48, 32, 32) }
                   status = TextView(this).apply { textSize = 15f; typeface = Typeface.MONOSPACE }
-                  pkgInput = EditText(this).apply { hint = "目标App包名，如 com.xxx.trade" ; setSingleLine() }
+                  pkgInput = EditText(this).apply { hint = "目标App包名"; setText("com.metaquotes.metatrader5"); setSingleLine() }
                   out = TextView(this).apply { textSize = 11f; typeface = Typeface.MONOSPACE }
 
                   col.addView(status)
                   col.addView(pkgInput)
                   col.addView(btn("1. 打开无障碍设置") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) })
+                  col.addView(btn("★ 6秒后读取当前窗口(先点它,再切到MT5)") {
+                      val s = BotAccessibilityService.instance
+                      if (s == null) BotLog.w("无障碍服务未运行，请把无障碍关掉再开一次") else s.scheduleDump(6000)
+                  })
                   col.addView(btn("2. 开始观察(只读)") { Bot.start(pkgInput.text.toString()) })
                   col.addView(btn("停止 STOP BOT") { Bot.stop() })
                   col.addView(btn("🛑 紧急停止") { Bot.safeStop("用户按下紧急停止") })
                   col.addView(btn("确认恢复(仅SAFE_STOP后)") { Bot.confirmRecover() })
-                  col.addView(btn("刷新日志/快照") { })
                   col.addView(btn("清除日志") { BotLog.clear() })
                   col.addView(out)
                   setContentView(ScrollView(this).apply { addView(col) })
               }
 
-              override fun onResume() { super.onResume(); refresh() }
+              override fun onResume() { super.onResume(); h.post(tick) }
+              override fun onPause() { super.onPause(); h.removeCallbacks(tick) }
 
               private fun a11yOn(): Boolean {
                   val s = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
@@ -263,7 +289,8 @@ jobs:
                       append("模式: DEMO 锁定(禁止真实交易)\n")
                       append("状态: ${Bot.state}\n")
                       if (Bot.stopReason.isNotEmpty()) append("停止原因: ${Bot.stopReason}\n")
-                      append("无障碍: ${if (a11yOn()) "已开启" else "未开启"}\n")
+                      append("无障碍设置: ${if (a11yOn()) "已开启" else "未开启"}\n")
+                      append("服务运行: ${if (BotAccessibilityService.instance != null) "是" else "否"}\n")
                       append("前台App: ${Bot.foreground.ifEmpty { "-" }}\n")
                       append("目标App: ${Bot.targetPackage.ifEmpty { "-" }}")
                   }
@@ -289,19 +316,16 @@ jobs:
               android:canRetrieveWindowContent="true"
               android:notificationTimeout="200" />
           ENDOFFILE
-
           cat > DemoBot/build.gradle.kts <<'ENDOFFILE'
           plugins {
               id("com.android.application") version "8.5.2" apply false
               id("org.jetbrains.kotlin.android") version "1.9.24" apply false
           }
           ENDOFFILE
-
           cat > DemoBot/gradle.properties <<'ENDOFFILE'
           org.gradle.jvmargs=-Xmx2g
           android.useAndroidX=false
           ENDOFFILE
-
           cat > DemoBot/settings.gradle.kts <<'ENDOFFILE'
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement { repositories { google(); mavenCentral() } }
