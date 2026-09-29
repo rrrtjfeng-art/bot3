@@ -22,8 +22,8 @@ jobs:
                   applicationId = "com.example.demobot"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "0.2"
+                  versionCode = 3
+                  versionName = "0.3"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -161,19 +161,18 @@ jobs:
               }
 
               private fun walk(n: AccessibilityNodeInfo, depth: Int, sb: StringBuilder, count: IntArray) {
-                  if (count[0] >= 400 || depth > 30) return
+                  if (count[0] >= 500 || depth > 30) return
                   count[0]++
-                  val text = if (n.isPassword) "***" else n.text?.toString()
-                  val hasInfo = !text.isNullOrBlank() || !n.contentDescription.isNullOrBlank() ||
-                      n.viewIdResourceName != null || n.isClickable
-                  if (hasInfo) {
-                      sb.append("  ".repeat(depth.coerceAtMost(8)))
-                        .append(n.className?.toString()?.substringAfterLast('.'))
-                        .append(" id=").append(n.viewIdResourceName?.substringAfter(":id/"))
-                        .append(" text=").append(text)
-                        .append(" desc=").append(n.contentDescription)
-                        .append(if (n.isClickable) " [可点击]" else "")
-                        .append('\n')
+                  val id = n.viewIdResourceName?.substringAfter(":id/")
+                  val text = if (n.isPassword) "***" else n.text?.toString()?.trim()
+                  val desc = n.contentDescription?.toString()?.trim()
+                  val noise = id != null && id.startsWith("navigation_bar_item_")
+                  if (!noise && (!text.isNullOrEmpty() || !desc.isNullOrEmpty() || (n.isClickable && id != null))) {
+                      sb.append(id ?: "-")
+                      if (!text.isNullOrEmpty()) sb.append(" | t=").append(text)
+                      if (!desc.isNullOrEmpty()) sb.append(" | d=").append(desc)
+                      if (n.isClickable) sb.append(" | 点")
+                      sb.append('\n')
                   }
                   for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, depth + 1, sb, count) }
               }
@@ -219,9 +218,10 @@ jobs:
               fun readLog(): String = try {
                   f()?.takeIf { it.exists() }?.readLines()?.takeLast(40)?.joinToString("\n") ?: "(无日志)"
               } catch (e: Exception) { "读取失败" }
-              fun readDump(): String = try {
-                  dir?.let { File(it, "last_dump.txt") }?.takeIf { it.exists() }?.readText()?.take(6000) ?: "(尚无界面快照)"
+              fun readDumpFull(): String = try {
+                  dir?.let { File(it, "last_dump.txt") }?.takeIf { it.exists() }?.readText() ?: "(尚无界面快照)"
               } catch (e: Exception) { "读取失败" }
+              fun readDump(): String = readDumpFull().take(2500)
               fun clear() { dir?.listFiles()?.forEach { it.delete() } }
           }
           ENDOFFILE
@@ -258,7 +258,7 @@ jobs:
                   val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 48, 32, 32) }
                   status = TextView(this).apply { textSize = 15f; typeface = Typeface.MONOSPACE }
                   pkgInput = EditText(this).apply { hint = "目标App包名"; setText("com.metaquotes.metatrader5"); setSingleLine() }
-                  out = TextView(this).apply { textSize = 11f; typeface = Typeface.MONOSPACE }
+                  out = TextView(this).apply { textSize = 11f; typeface = Typeface.MONOSPACE; setTextIsSelectable(true) }
 
                   col.addView(status)
                   col.addView(pkgInput)
@@ -266,6 +266,15 @@ jobs:
                   col.addView(btn("★ 6秒后读取当前窗口(先点它,再切到MT5)") {
                       val s = BotAccessibilityService.instance
                       if (s == null) BotLog.w("无障碍服务未运行，请把无障碍关掉再开一次") else s.scheduleDump(6000)
+                  })
+                  col.addView(btn("📋 复制完整快照(粘贴发给Claude)") {
+                      val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                      cm.setPrimaryClip(android.content.ClipData.newPlainText("dump", BotLog.readDumpFull()))
+                      BotLog.i("完整快照已复制到剪贴板")
+                  })
+                  col.addView(btn("📤 分享快照(可发到备忘录/微信)") {
+                      val i = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, BotLog.readDumpFull()) }
+                      startActivity(Intent.createChooser(i, "分享快照"))
                   })
                   col.addView(btn("2. 开始观察(只读)") { Bot.start(pkgInput.text.toString()) })
                   col.addView(btn("停止 STOP BOT") { Bot.stop() })
@@ -286,6 +295,7 @@ jobs:
 
               private fun refresh() {
                   status.text = buildString {
+                      append("版本: 0.3 复制版\n")
                       append("模式: DEMO 锁定(禁止真实交易)\n")
                       append("状态: ${Bot.state}\n")
                       if (Bot.stopReason.isNotEmpty()) append("停止原因: ${Bot.stopReason}\n")
@@ -347,12 +357,8 @@ jobs:
       - name: Build
         working-directory: DemoBot
         run: gradle assembleDebug --stacktrace
-      - uses: actions/upload-artifact@v4
-        with:
-          name: demo-bot-apk
-          path: DemoBot/app/build/outputs/apk/debug/app-debug.apk
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v${{ github.run_number }}" DemoBot/app/build/outputs/apk/debug/app-debug.apk --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DemoBot v${{ github.run_number }}" --notes "APK"
+          gh release create "v${{ github.run_number }}" DemoBot/app/build/outputs/apk/debug/app-debug.apk --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "复制版 v${{ github.run_number }}" --notes "版本0.3 含复制按钮"
