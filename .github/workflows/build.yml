@@ -3,6 +3,8 @@ on: [push, workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Write project files
         run: |
@@ -325,3 +327,8 @@ jobs:
         with:
           name: demo-bot-apk
           path: DemoBot/app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ github.run_number }}" DemoBot/app/build/outputs/apk/debug/app-debug.apk --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DemoBot v${{ github.run_number }}" --notes "APK"
