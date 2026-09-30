@@ -1,0 +1,327 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Write project files
+        run: |
+          mkdir -p DemoBot
+          mkdir -p DemoBot/app
+          cat > DemoBot/app/build.gradle.kts <<'ENDOFFILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.demobot"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.demobot"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.2"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          ENDOFFILE
+          mkdir -p DemoBot/app/src/main
+          cat > DemoBot/app/src/main/AndroidManifest.xml <<'ENDOFFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".BotAccessibilityService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          ENDOFFILE
+          mkdir -p DemoBot/app/src/main/java/com/example/demobot
+          cat > DemoBot/app/src/main/java/com/example/demobot/Bot.kt <<'ENDOFFILE'
+          package com.example.demobot
+
+          /** 全局状态机。当前阶段只有 IDLE / OBSERVING / SAFE_STOP，且不会自动恢复。 */
+          object Bot {
+              enum class State { IDLE, OBSERVING, SAFE_STOP }
+
+              const val DEMO_MODE_LOCK = true   // 第一阶段：禁止真实账户/真实交易
+
+              @Volatile var state = State.IDLE
+              @Volatile var targetPackage = ""
+              @Volatile var foreground = ""
+              @Volatile var stopReason = ""
+
+              fun start(pkg: String): Boolean {
+                  if (state != State.IDLE || pkg.isBlank()) return false
+                  targetPackage = pkg.trim()
+                  state = State.OBSERVING
+                  BotLog.i("开始观察: $targetPackage")
+                  return true
+              }
+
+              fun stop() {
+                  state = State.IDLE
+                  BotLog.i("用户停止")
+              }
+
+              fun safeStop(reason: String) {
+                  state = State.SAFE_STOP
+                  stopReason = reason
+                  BotLog.w("SAFE_STOP: $reason")
+              }
+
+              /** 必须由用户手动确认才能从 SAFE_STOP 回到 IDLE */
+              fun confirmRecover() {
+                  if (state == State.SAFE_STOP) { state = State.IDLE; stopReason = ""; BotLog.i("用户确认恢复") }
+              }
+          }
+          ENDOFFILE
+          mkdir -p DemoBot/app/src/main/java/com/example/demobot
+          cat > DemoBot/app/src/main/java/com/example/demobot/BotAccessibilityService.kt <<'ENDOFFILE'
+          package com.example.demobot
+
+          import android.accessibilityservice.AccessibilityService
+          import android.os.SystemClock
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          /** 阶段2：只读。遍历目标App的UI树并保存快照，不做任何点击或输入。 */
+          class BotAccessibilityService : AccessibilityService() {
+              private var lastDump = 0L
+
+              override fun onServiceConnected() {
+                  BotLog.init(this)
+                  BotLog.i("无障碍服务已连接")
+              }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+                  e ?: return
+                  val pkg = e.packageName?.toString() ?: return
+                  if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+                      pkg != "com.android.systemui") Bot.foreground = pkg
+
+                  if (Bot.state != Bot.State.OBSERVING) return
+                  if (pkg != Bot.targetPackage) return
+                  val now = SystemClock.elapsedRealtime()
+                  if (now - lastDump < 2000) return
+                  lastDump = now
+                  dump()
+              }
+
+              private fun dump() {
+                  val root = rootInActiveWindow
+                  if (root == null) { BotLog.w("读不到界面(可能被目标App屏蔽)"); return }
+                  if (root.packageName?.toString() != Bot.targetPackage) return
+                  val sb = StringBuilder()
+                  val count = intArrayOf(0)
+                  walk(root, 0, sb, count)
+                  BotLog.saveDump("节点数:${count[0]}\n$sb")
+                  BotLog.i("已保存界面快照，节点 ${count[0]}")
+              }
+
+              private fun walk(n: AccessibilityNodeInfo, depth: Int, sb: StringBuilder, count: IntArray) {
+                  if (count[0] >= 400 || depth > 30) return
+                  count[0]++
+                  val text = if (n.isPassword) "***" else n.text?.toString()
+                  val hasInfo = !text.isNullOrBlank() || !n.contentDescription.isNullOrBlank() ||
+                      n.viewIdResourceName != null || n.isClickable
+                  if (hasInfo) {
+                      sb.append("  ".repeat(depth.coerceAtMost(8)))
+                        .append(n.className?.toString()?.substringAfterLast('.'))
+                        .append(" id=").append(n.viewIdResourceName?.substringAfter(":id/"))
+                        .append(" text=").append(text)
+                        .append(" desc=").append(n.contentDescription)
+                        .append(if (n.isClickable) " [可点击]" else "")
+                        .append('\n')
+                  }
+                  for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, depth + 1, sb, count) }
+              }
+
+              override fun onInterrupt() {
+                  if (Bot.state == Bot.State.OBSERVING) Bot.safeStop("无障碍服务被中断")
+              }
+
+              override fun onUnbind(intent: android.content.Intent?): Boolean {
+                  if (Bot.state == Bot.State.OBSERVING) Bot.safeStop("无障碍权限被撤销")
+                  return super.onUnbind(intent)
+              }
+          }
+          ENDOFFILE
+          mkdir -p DemoBot/app/src/main/java/com/example/demobot
+          cat > DemoBot/app/src/main/java/com/example/demobot/BotLog.kt <<'ENDOFFILE'
+          package com.example.demobot
+
+          import android.content.Context
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          /** 本地日志，仅保存在应用私有目录。 */
+          object BotLog {
+              private var dir: File? = null
+              private val fmt = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+
+              fun init(c: Context) { if (dir == null) dir = File(c.filesDir, "logs").apply { mkdirs() } }
+              private fun f() = dir?.let { File(it, "bot.log") }
+
+              private fun add(level: String, msg: String) {
+                  try { f()?.appendText("${fmt.format(Date())} [$level] $msg\n") } catch (_: Exception) {}
+              }
+              fun i(m: String) = add("I", m)
+              fun w(m: String) = add("W", m)
+
+              fun saveDump(text: String) {
+                  try { dir?.let { File(it, "last_dump.txt").writeText(text) } } catch (_: Exception) {}
+              }
+              fun readLog(): String = try {
+                  f()?.takeIf { it.exists() }?.readLines()?.takeLast(40)?.joinToString("\n") ?: "(无日志)"
+              } catch (e: Exception) { "读取失败" }
+              fun readDump(): String = try {
+                  dir?.let { File(it, "last_dump.txt") }?.takeIf { it.exists() }?.readText()?.take(6000) ?: "(尚无界面快照)"
+              } catch (e: Exception) { "读取失败" }
+              fun clear() { dir?.listFiles()?.forEach { it.delete() } }
+          }
+          ENDOFFILE
+          mkdir -p DemoBot/app/src/main/java/com/example/demobot
+          cat > DemoBot/app/src/main/java/com/example/demobot/MainActivity.kt <<'ENDOFFILE'
+          package com.example.demobot
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var status: TextView
+              private lateinit var pkgInput: EditText
+              private lateinit var out: TextView
+
+              private fun btn(label: String, onClick: () -> Unit) = Button(this).apply {
+                  text = label; setOnClickListener { onClick(); refresh() }
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  BotLog.init(this)
+                  Bot.state = Bot.State.IDLE            // 重启后绝不自动续作
+
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 48, 32, 32) }
+                  status = TextView(this).apply { textSize = 15f; typeface = Typeface.MONOSPACE }
+                  pkgInput = EditText(this).apply { hint = "目标App包名，如 com.xxx.trade" ; setSingleLine() }
+                  out = TextView(this).apply { textSize = 11f; typeface = Typeface.MONOSPACE }
+
+                  col.addView(status)
+                  col.addView(pkgInput)
+                  col.addView(btn("1. 打开无障碍设置") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) })
+                  col.addView(btn("2. 开始观察(只读)") { Bot.start(pkgInput.text.toString()) })
+                  col.addView(btn("停止 STOP BOT") { Bot.stop() })
+                  col.addView(btn("🛑 紧急停止") { Bot.safeStop("用户按下紧急停止") })
+                  col.addView(btn("确认恢复(仅SAFE_STOP后)") { Bot.confirmRecover() })
+                  col.addView(btn("刷新日志/快照") { })
+                  col.addView(btn("清除日志") { BotLog.clear() })
+                  col.addView(out)
+                  setContentView(ScrollView(this).apply { addView(col) })
+              }
+
+              override fun onResume() { super.onResume(); refresh() }
+
+              private fun a11yOn(): Boolean {
+                  val s = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+                  return s.contains("$packageName/")
+              }
+
+              private fun refresh() {
+                  status.text = buildString {
+                      append("模式: DEMO 锁定(禁止真实交易)\n")
+                      append("状态: ${Bot.state}\n")
+                      if (Bot.stopReason.isNotEmpty()) append("停止原因: ${Bot.stopReason}\n")
+                      append("无障碍: ${if (a11yOn()) "已开启" else "未开启"}\n")
+                      append("前台App: ${Bot.foreground.ifEmpty { "-" }}\n")
+                      append("目标App: ${Bot.targetPackage.ifEmpty { "-" }}")
+                  }
+                  out.text = "—— 日志 ——\n${BotLog.readLog()}\n\n—— 最近界面快照 ——\n${BotLog.readDump()}"
+              }
+          }
+          ENDOFFILE
+          mkdir -p DemoBot/app/src/main/res/values
+          cat > DemoBot/app/src/main/res/values/strings.xml <<'ENDOFFILE'
+          <resources>
+              <string name="app_name">模拟交易机器人</string>
+              <string name="a11y_desc">仅用于读取你指定的交易App界面（模拟账户），在本机记录节点信息。当前版本不执行任何点击。</string>
+          </resources>
+          ENDOFFILE
+          mkdir -p DemoBot/app/src/main/res/xml
+          cat > DemoBot/app/src/main/res/xml/accessibility_config.xml <<'ENDOFFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/a11y_desc"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="200" />
+          ENDOFFILE
+
+          cat > DemoBot/build.gradle.kts <<'ENDOFFILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          ENDOFFILE
+
+          cat > DemoBot/gradle.properties <<'ENDOFFILE'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          ENDOFFILE
+
+          cat > DemoBot/settings.gradle.kts <<'ENDOFFILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "DemoBot"
+          include(":app")
+          ENDOFFILE
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Accept licenses and install SDK
+        run: |
+          SDKM=$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager
+          yes | $SDKM --licenses > /dev/null || true
+          $SDKM "platforms;android-34" "build-tools;34.0.0" > /dev/null
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build
+        working-directory: DemoBot
+        run: gradle assembleDebug --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demo-bot-apk
+          path: DemoBot/app/build/outputs/apk/debug/app-debug.apk
